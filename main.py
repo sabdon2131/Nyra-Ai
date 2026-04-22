@@ -38,7 +38,7 @@ conversation_history = []
 # ----------------------------
 # OPENROUTER KEY
 # ----------------------------
-OPENROUTER_API_KEY = "your api key"
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 
 # ----------------------------
 # SYSTEM PROMPT
