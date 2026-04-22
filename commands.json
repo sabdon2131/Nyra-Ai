@@ -1,0 +1,4 @@
+{
+ "open chrome":"com.android.chrome/com.google.android.apps.chrome.Main",
+ "open whatsapp":"com.whatsapp/.HomeActivity"
+}
