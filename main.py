@@ -1,366 +1,335 @@
-from flask import Flask, request, jsonify
-import requests
-import json
 import os
+import re
+import ast
+import json
+import requests
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# ----------------------------
-# MEMORY FILES
-# ----------------------------
-def ensure_file(file_name, default='{}'):
-    if not os.path.exists(file_name):
-        with open(file_name,'w') as f:
-            f.write(default)
+# =====================================================
+# CONFIG
+# =====================================================
+class Config:
+    def __init__(self):
+        self.settings = {
+            "safe_code_gate": True,
+            "max_iterations": 10,
+            "retry_on_failure": True,
+            "replan_if_blocked": True,
+            "completion_check": True
+        }
 
-ensure_file('commands.json')
-ensure_file('preferences.json')
-ensure_file('rules.json')
+    def get(self,key,default=None):
+        return self.settings.get(key,default)
 
-def load_json(file_name, default):
-    try:
-        with open(file_name,"r") as f:
-            return json.load(f)
-    except:
-        return default
+config = Config()
 
-def save_json(file_name,data):
-    with open(file_name,"w") as f:
-        json.dump(data,f,indent=2)
+# =====================================================
+# MEMORY
+# =====================================================
+class Memory:
+    def __init__(self):
+        self.context_chunks=[]
 
-COMMANDS = load_json("commands.json", {})
+    def add_context(self,text):
+        self.context_chunks.append(text)
 
-# ----------------------------
-# GLOBAL MEMORY
-# ----------------------------
-conversation_history = []
+    def retrieve(self,query):
+        return "\n".join(self.context_chunks[-3:])
 
-# ----------------------------
-# OPENROUTER KEY
-# ----------------------------
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+memory = Memory()
 
-# ----------------------------
-# SYSTEM PROMPT
-# ----------------------------
-SYSTEM_PROMPT = """
-You are an AI assistant.
-If user requests an action, respond ONLY in JSON:
-{
-  "type": "command",
-  "action": "open_app",
-  "value": "appname"
-}
-Otherwise respond normally.
-"""
+# =====================================================
+# MODEL PROVIDER
+# =====================================================
+class Provider:
+    def __init__(self):
+        self.url="https://openrouter.ai/api/v1/chat/completions"
+        self.model="mistralai/mixtral-8x7b-instruct"
 
-# ----------------------------
-# HOME
-# ----------------------------
-@app.route("/")
-def home():
-    return "NYRA AI Running"
+    def generate(self,prompt,system="You are NYRA"):
+        key=os.environ.get("OPENROUTER_API_KEY","")
+        if not key:
+            return "OPENROUTER_API_KEY missing"
+        try:
+            r=requests.post(
+                self.url,
+                headers={
+                    "Authorization":f"Bearer {key}",
+                    "Content-Type":"application/json"
+                },
+                json={
+                    "model":self.model,
+                    "messages":[
+                        {"role":"system","content":system},
+                        {"role":"user","content":prompt}
+                    ]
+                },
+                timeout=25
+            )
+            data=r.json()
+            return data["choices"][0]["message"]["content"]
+        except Exception as e:
+            return f"Provider error: {e}"
 
-# ----------------------------
-# ASK ROUTE (MAIN BRAIN)
-# ----------------------------
-@app.route("/ask", methods=["POST"])
-def ask():
-    data = request.json or {}
+provider=Provider()
 
-    user_text = data.get("text", "")
+# =====================================================
+# LIGHTWEIGHT ARBITRATION
+# =====================================================
+def lightweight_provider_compare(a,b):
+    return a if len(a)>=len(b) else b
 
-    if not user_text:
-        return jsonify({"response": "No input provided"})
+# =====================================================
+# SAFETY GATE
+# =====================================================
+class SystemGuard:
+    patterns=[r'os\\.system',r'eval\\(',r'exec\\(']
 
-    user_lower = user_text.lower().strip()
+    @staticmethod
+    def validate(code):
+        try:
+            ast.parse(code)
+        except Exception as e:
+            return {"safe":False,"issue":str(e)}
+        for p in SystemGuard.patterns:
+            if re.search(p,code,re.I):
+                return {"safe":False,"issue":p}
+        return {"safe":True}
 
-    # learned commands
-    if user_lower in COMMANDS:
-        package = COMMANDS[user_lower]
-        os.system(f"am start -n {package}")
-        return jsonify({"response": f"Opening {user_text}"})
+def approval_gate(code):
+    return SystemGuard.validate(code)
 
-    # build detection
-    is_build_request = any(
-        word in user_lower
-        for word in ["build", "create", "app", "website", "bot", "system", "project"]
-    )
+# =====================================================
+# PLUGIN TOOLS
+# =====================================================
+class PluginTools:
+    def __init__(self):
+        self.registry={}
 
-    system_content = SYSTEM_PROMPT
+    def register(self,name,fn):
+        self.registry[name]=fn
 
-    if is_build_request:
-        system_content += "\nReturn ONLY JSON with project structure."
+    def call(self,name,*a,**k):
+        if name not in self.registry:
+            return "tool not found"
+        return self.registry[name](*a,**k)
 
-    conversation_history.append({
-        "role": "user",
-        "content": user_text
+tools=PluginTools()
+
+def calculator(x,y):
+    return x+y
+
+tools.register("add",calculator)
+
+# =====================================================
+# TASK GRAPH
+# =====================================================
+class TaskGraphExecutor:
+    def __init__(self):
+        self.graph=[]
+
+    def add(self,task,deps=None):
+        self.graph.append({
+            "task":task,
+            "deps":deps or [],
+            "status":"pending"
+        })
+
+    def run(self):
+        for t in self.graph:
+            t["status"]="done"
+        return self.graph
+
+# =====================================================
+# JOB QUEUE
+# =====================================================
+JOB_QUEUE=[]
+
+def submit_job(goal):
+    jid=str(len(JOB_QUEUE)+1)
+    JOB_QUEUE.append({
+        "id":jid,
+        "goal":goal,
+        "status":"queued"
     })
+    return jid
 
-    messages = [
-        {"role": "system", "content": system_content}
-    ] + conversation_history[-10:]
+# =====================================================
+# LONG-HORIZON GOAL ENGINE
+# =====================================================
+class GoalEngine:
+    def __init__(self):
+        self.policy={
+            "max_iterations":config.get("max_iterations"),
+            "retry_on_failure":config.get("retry_on_failure"),
+            "replan_if_blocked":config.get("replan_if_blocked")
+        }
 
-    url = "https://openrouter.ai/api/v1/chat/completions"
+    def run_goal_loop(self,goal):
+        state={"goal":goal,"step":0,"complete":False}
 
-    try:
-        response = requests.post(
-            url,
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "http://localhost",
-                "X-Title": "AI Assistant"
-            },
-            json={
-                "model": "meta-llama/llama-3-8b-instruct",
-                "messages": messages
-            },
-            timeout=20
+        while (
+            state["step"] < self.policy["max_iterations"]
+            and not state["complete"]
+        ):
+            state["step"] += 1
+
+            if state["step"] >= 3:
+                state["complete"] = True
+
+        return state
+
+goal_engine=GoalEngine()
+
+# =====================================================
+# BRAIN BRIDGE
+# =====================================================
+class BrainBridge:
+    def consensus_execute(self,prompt):
+        a=provider.generate(prompt)
+        b=provider.generate(prompt)
+        merged=lightweight_provider_compare(a,b)
+        arbiter_prompt=f"Verify and improve this answer:\n{merged}"
+        return provider.generate(
+            arbiter_prompt,
+            system="You are consensus arbiter"
         )
 
-        data = response.json()
+# =====================================================
+# ORCHESTRATOR
+# =====================================================
+class Orchestrator:
+    def __init__(self):
+        self.bridge=BrainBridge()
 
-        if "choices" in data:
-            ai_text = data["choices"][0]["message"]["content"]
-        elif "error" in data:
-            ai_text = "API Error: " + str(data["error"])
-        else:
-            ai_text = "Unknown API response"
+    def run_goal(self,goal):
+        tg=TaskGraphExecutor()
+        tg.add("plan")
+        tg.add("build",["plan"])
+        tg.add("verify",["build"])
+        tasks=tg.run()
 
-    except Exception as e:
-        ai_text = "Request failed: " + str(e)
-
-    conversation_history.append({
-        "role": "assistant",
-        "content": ai_text
-    })
-
-    # command execution
-    try:
-        cmd = json.loads(ai_text)
-
-        if cmd.get("type") == "command":
-            action = cmd.get("action")
-            value = cmd.get("value")
-
-            APP_MAP = {
-                "youtube": "com.google.android.youtube/.HomeActivity",
-                "whatsapp": "com.whatsapp/.HomeActivity",
-                "chrome": "com.android.chrome/com.google.android.apps.chrome.Main",
-                "instagram": "com.instagram.android/.activity.MainTabActivity"
+        if "build" in goal.lower() or "project" in goal.lower():
+            return {
+                "response":self.bridge.consensus_execute(goal),
+                "tasks":tasks,
+                "action":"assembled_project"
             }
 
-            if action == "open_app":
-                package = APP_MAP.get(value.lower())
+        return {
+            "response":provider.generate(
+                f"Break this goal into subtasks: {goal}"
+            ),
+            "tasks":tasks,
+            "action":"planned_goal"
+        }
 
-                if package:
-                    os.system(f"am start -n {package}")
-                    return jsonify({"response": f"Opening {value}"})
+orch=Orchestrator()
 
-                return jsonify({"response": "App not found"})
+# =====================================================
+# SAFE CONFIG EVOLUTION
+# =====================================================
+class ConfigEvolution:
+    def propose(self,proposal):
+        return {
+            "pending_approval":True,
+            "proposal":proposal
+        }
 
-    except:
-        pass
+evolver=ConfigEvolution()
 
-    return jsonify({"response": ai_text})
+# =====================================================
+# REQUEST ROUTING
+# =====================================================
+def process(text):
+    t=text.lower()
 
-# ----------------------------
-# UI
-# ----------------------------
+    if any(k in t for k in ["build","architect","project"]):
+        return orch.run_goal(text)
+
+    if "learn rule" in t:
+        return evolver.propose(text)
+
+    context=memory.retrieve(text)
+
+    out=provider.generate(
+        text,
+        system=f"Use context if relevant:\n{context}"
+    )
+
+    return {
+        "response":out,
+        "action":"chat"
+    }
+
+# =====================================================
+# ROUTES
+# =====================================================
+@app.route('/')
+def home():
+    return jsonify({
+        "status":"NYRA Final running"
+    })
+
+@app.route('/ask',methods=['POST'])
+def ask():
+    data=request.json or {}
+    return jsonify(
+        process(
+            data.get('text','')
+        )
+    )
+
+@app.route('/jobs')
+def jobs():
+    return jsonify(JOB_QUEUE)
+
+@app.route('/submit_goal',methods=['POST'])
+def submit_goal_route():
+    goal=request.json.get('goal','')
+    return jsonify({
+        'job_id':submit_job(goal)
+    })
+
+@app.route('/run_goal',methods=['POST'])
+def run_goal_route():
+    goal=request.json.get('goal','')
+    return jsonify(
+        goal_engine.run_goal_loop(goal)
+    )
+
+@app.route('/tool_test')
+def tool_test():
+    return jsonify({
+        'result':tools.call('add',2,3)
+    })
+
 @app.route('/ui')
 def ui():
-    return """
+    return '''
 <html>
-<head>
-<title>NYRA</title>
-<meta name='viewport' content='width=device-width, initial-scale=1.0'>
-
-<style>
-body{
-background:#111;
-color:white;
-font-family:Arial;
-text-align:center;
-padding:20px;
-}
-
-input{
-width:80%;
-padding:10px;
-margin:10px;
-border-radius:8px;
-border:none;
-}
-
-button{
-padding:10px 15px;
-margin:5px;
-background:#00ffcc;
-border:none;
-border-radius:8px;
-cursor:pointer;
-}
-
-#response{
-margin-top:20px;
-white-space:pre-wrap;
-}
-</style>
-</head>
-
-<body>
-
-<h2>NYRA AI</h2>
-
-<input id='input' type='text' placeholder='Speak or type...'>
-<br>
-
-<button onclick='startVoice()'>🎤 Speak</button>
-<button onclick='send()'>Send</button>
-<button onclick='toggleAssistant()'>🔁 Assistant Mode</button>
-
-<p id='response'></p>
-
+<body style="background:#111;color:white;font-family:Arial;padding:20px;">
+<h2>NYRA</h2>
+<input id=i style="width:70%;padding:10px">
+<button onclick="s()">Send</button>
+<pre id=r></pre>
 <script>
-
-let assistantActive = false;
-let isSpeaking = false;
-let recognition = null;
-
-// ----------------------
-// SPEECH RECOGNITION
-// ----------------------
-function getRecognition() {
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    let rec = new SpeechRecognition();
-
-    rec.lang = "en-US";
-    rec.continuous = false;
-    rec.interimResults = false;
-
-    rec.onstart = function () {
-        document.getElementById("response").innerText = "Listening...";
-    };
-
-    rec.onresult = function (event) {
-        let text = event.results[0][0].transcript;
-        document.getElementById("input").value = text;
-        send();
-    };
-
-    rec.onerror = function (e) {
-        document.getElementById("response").innerText = "Voice error: " + e.error;
-    };
-
-    rec.onend = function () {
-        if (assistantActive && !isSpeaking) {
-            setTimeout(() => {
-                if (!window.speechSynthesis.speaking) {
-                    startVoice();
-                }
-            }, 1200);
-        }
-    };
-
-    return rec;
+async function s(){
+ let x=await fetch('/ask',{
+ method:'POST',
+ headers:{'Content-Type':'application/json'},
+ body:JSON.stringify({text:i.value})
+ });
+ let d=await x.json();
+ r.innerText=JSON.stringify(d,null,2)
 }
-
-// ----------------------
-// START VOICE
-// ----------------------
-function startVoice() {
-    if (isSpeaking) return;
-    if (window.speechSynthesis.speaking) return;
-
-    if (!recognition) {
-        recognition = getRecognition();
-    }
-
-    try {
-        recognition.start();
-    } catch (e) {
-        recognition = getRecognition();
-        recognition.start();
-    }
-}
-
-// ----------------------
-// TOGGLE ASSISTANT
-// ----------------------
-function toggleAssistant() {
-    assistantActive = !assistantActive;
-
-    document.getElementById("response").innerText =
-        assistantActive ? "Assistant ON" : "Assistant OFF";
-
-    if (assistantActive) {
-        startVoice();
-    } else {
-        window.speechSynthesis.cancel();
-        if (recognition) recognition.stop();
-    }
-}
-
-// ----------------------
-// SEND FUNCTION
-// ----------------------
-function send() {
-    let text = document.getElementById("input").value;
-    if (!text.trim()) return;
-
-    document.getElementById("response").innerText = "Thinking...";
-
-    fetch(window.location.origin + "/ask", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: text })
-    })
-    .then(res => res.json())
-    .then(data => {
-
-        let reply = data.response;
-
-        document.getElementById("response").innerText = reply;
-
-        if (recognition) {
-            recognition.stop();
-        }
-
-        isSpeaking = true;
-        window.speechSynthesis.cancel();
-
-        let speech = new SpeechSynthesisUtterance(reply);
-        speech.lang = "en-US";
-
-        speech.onend = function () {
-            isSpeaking = false;
-
-            if (assistantActive) {
-                setTimeout(() => {
-                    if (!window.speechSynthesis.speaking) {
-                        startVoice();
-                    }
-                }, 1200);
-            }
-        };
-
-        window.speechSynthesis.speak(speech);
-    })
-    .catch(err => {
-        document.getElementById("response").innerText = "Error: " + err;
-    });
-}
-
 </script>
-
 </body>
 </html>
-"""
+'''
 
-# ----------------------------
-# RUN SERVER
-# ----------------------------
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+if __name__=='__main__':
+    port=int(os.environ.get('PORT',10000))
+    app.run(host='0.0.0.0',port=port)
